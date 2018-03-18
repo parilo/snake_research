@@ -26,7 +26,7 @@ def softmax(x):
 
 class SnakeAgent:
     
-    def __init__(self, state_shape=[4, 4, 3], model_name="baseline_agent"):
+    def __init__(self, state_shape=[4, 4, 3], model_name="baseline_agent", priority=None):
         
         """Class for training and evaluating DQN agent on Atari games
         
@@ -44,7 +44,7 @@ class SnakeAgent:
         
         self.train_env = Snake(grid_size=state_shape[:-1])
         self.num_actions = 3
-            
+        self.priority = None
         self.path = "snake_models/" + model_name
         if not os.path.exists(self.path):
             os.makedirs(self.path)
@@ -66,17 +66,20 @@ class SnakeAgent:
                        final_eps=0.02,
                        annealing_steps=100000,
                        discount_factor=0.99,
-                       max_episode_length=2000):
+                       max_episode_length=2000,
+                       alpha=0.7):
         
         # create experience replay and fill it with random policy samples
-        self.rep_buffer = ReplayMemory(replay_memory_size)
+  
+        self.rep_buffer = ReplayMemoryPrio(replay_memory_size, preprocess_fn=lambda x: x**(alpha) / (x**alpha).sum())
+            
         frame_count = 0
         while (frame_count < replay_start_size):
             s = self.train_env.reset()
             for time_step in range(max_episode_length):
                 a = np.random.randint(self.num_actions)
                 s_, r, end = self.train_env.step(a)
-                self.rep_buffer.push(s, a, r, s_, end)
+                self.rep_buffer.push(1.0, s, a, r, s_, end)
                 s = s_
                 frame_count += 1
                 if end: break
@@ -93,6 +96,7 @@ class SnakeAgent:
               gpu_id=0,
               batch_size=32,
               exploration="e-greedy",
+              priority=None,
               agent_update_freq=4,
               target_update_freq=5000,
               tau=1,
@@ -147,7 +151,9 @@ class SnakeAgent:
                     s_, r, end = self.train_env.step(a)
                     
                     # save transition into experience replay
-                    self.rep_buffer.push(s, a, r, s_, end)
+                    w = self.get_priority_weight(sess, s, a, r, s_, priority=self.priority)
+                    
+                    self.rep_buffer.push(w, s, a, r, s_, end)
                     
                     # update current state and statistics
                     s = s_
@@ -215,7 +221,22 @@ class SnakeAgent:
             return 0
         return a
             
-                    
+    def get_priority_weight(self, sess, s, a, r, s_, priority=None):
+        
+        if priority is None:
+            return 1.0   
+        
+        elif priority == 'bellman_error':
+         
+            q = self.agent_net.get_q_values(sess, [s])[0][a]
+            a_ = self.agent_net.get_q_argmax(sess, [s_])[0]
+            q_ = self.agent_net.get_q_values(sess, [s_])[0][a_]
+            return np.abs(r + self.gamma * q_ - q)
+        
+        else:
+            raise NotImplementedError('Other options are not supported yet')
+        
+    
     def update_agent_weights(self, sess, batch):
         pass
 
@@ -305,10 +326,12 @@ class SnakeDQNAgent(SnakeAgent):
                  convs=[[16, 2, 1], [32, 1, 1]], 
                  fully_connected=[128],
                  optimizer=tf.train.AdamOptimizer(2.5e-4),
-                 model_name="DQN"):
+                 model_name="DQN",
+                 priority=None):
         
         super(SnakeDQNAgent, self).__init__(state_shape=state_shape,
-                                            model_name=model_name)
+                                            model_name=model_name,
+                                            priority=priority)
         
         tf.reset_default_graph()
         self.agent_net = QNetwork(self.num_actions, state_shape=state_shape,
