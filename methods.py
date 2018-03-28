@@ -2,8 +2,10 @@ import numpy as np
 import random
 import tensorflow as tf
 import tensorflow.contrib.layers as layers
+import t3f
 from collections import deque, namedtuple
 from tensorflow.contrib import rnn
+
 ####################################################################################################
 ########################################## Deep Q-Network ##########################################
 ####################################################################################################
@@ -56,7 +58,7 @@ class QNetwork:
                                                kernel_size=kernel_size,
                                                stride=stride,
                                                padding='VALID',
-                                               activation_fn=tf.nn.elu)
+                                               activation_fn=tf.nn.relu)
             out = layers.flatten(out)
 
             # fully connected part of the network
@@ -64,13 +66,134 @@ class QNetwork:
                 for num_outputs in fully_connected:
                     out = layers.fully_connected(out,
                                                  num_outputs=num_outputs,
-                                                 activation_fn=tf.nn.elu,
+                                                 activation_fn=tf.nn.relu,
                                                  weights_initializer=xavier)
+                    self.out = out
 
             # q-values estimation
             with tf.variable_scope("q_values"):
                 q_weights = tf.Variable(xavier([fully_connected[-1], num_actions]))
                 self.q_values = tf.matmul(out, q_weights)
+
+        ######################### Optimization procedure ########################
+
+        # one-hot encode actions to get q-values for state-action pairs
+        self.input_actions = tf.placeholder(dtype=tf.int32, shape=[None])
+        actions_onehot = tf.one_hot(self.input_actions, num_actions, dtype=tf.float32)
+        q_values_selected = tf.reduce_sum(tf.multiply(self.q_values, actions_onehot), axis=1)
+
+        # choose best actions (according to q-values)
+        self.q_argmax = tf.argmax(self.q_values, axis=1)
+
+        # create loss function and update rule
+        self.targets = tf.placeholder(dtype=tf.float32, shape=[None])
+        self.td_error = tf.losses.huber_loss(self.targets, q_values_selected)
+        self.loss = tf.reduce_sum(self.td_error)
+        self.update_model = optimizer.minimize(self.loss)
+        
+    def get_features(self, sess, states):
+        feed_dict = {self.input_states:states}
+        features = sess.run(self.out, feed_dict)
+        return features
+
+    def get_q_argmax(self, sess, states):
+        feed_dict = {self.input_states:states}
+        q_argmax = sess.run(self.q_argmax, feed_dict)
+        return q_argmax
+
+    def get_q_values(self, sess, states):
+        feed_dict = {self.input_states:states}
+        q_values = sess.run(self.q_values, feed_dict)
+        return q_values
+
+    def update(self, sess, states, actions, targets):
+
+        feed_dict = {self.input_states:states,
+                     self.input_actions:actions,
+                     self.targets:targets}
+        sess.run(self.update_model, feed_dict)
+
+####################################################################################################
+###################################### Dueling Deep Q-Network ######################################
+####################################################################################################
+
+class DuelQNetwork:
+
+    def __init__(self, num_actions, state_shape=[8, 8, 1],
+                 convs=[[32, 4, 2], [64, 2, 1]],
+                 fully_connected=[128],
+                 optimizer=tf.train.AdamOptimizer(2.5e-4),
+                 scope="q_network", reuse=False):
+
+        """Class for neural network which estimates Q-function
+
+        Parameters
+        ----------
+        num_actions: int
+            number of actions the agent can take
+        state_shape: list
+            list of 3 parameters [frame_w, frame_h, num_frames]
+            frame_w: frame width
+            frame_h: frame height
+            num_frames: number of successive frames considered as a state
+        conv: list
+            list of convolutional layers' parameters, each element
+            has the form -- [num_outputs, kernel_size, stride]
+        fully_connected: list
+            list of fully connected layers' parameters, each element
+            has the form -- num_outputs
+        optimizer: tf.train optimizer
+            optimization algorithm for stochastic gradient descend
+        scope: str
+            unique name of a specific network
+        """
+
+        xavier = layers.xavier_initializer()
+
+        ###################### Neural network architecture ######################
+
+        input_shape = [None] + state_shape
+        self.input_states = tf.placeholder(dtype=tf.float32, shape=input_shape)
+
+        with tf.variable_scope(scope, reuse=reuse):
+            # convolutional part of the network
+            out = self.input_states
+            with tf.variable_scope("conv"):
+                for num_outputs, kernel_size, stride in convs:
+                    out = layers.convolution2d(out,
+                                               num_outputs=num_outputs,
+                                               kernel_size=kernel_size,
+                                               stride=stride,
+                                               padding='VALID',
+                                               activation_fn=tf.nn.relu)
+            adv, val = tf.split(out, num_or_size_splits=2, axis=3)
+            adv = layers.flatten(adv)
+            val = layers.flatten(val)
+
+            # advantage function estimation
+            with tf.variable_scope("advantage"):
+                for num_outputs in fully_connected:
+                    adv = layers.fully_connected(adv,
+                                                 num_outputs=num_outputs,
+                                                 activation_fn=tf.nn.relu,
+                                                 weights_initializer=xavier)
+                adv_weights = tf.Variable(xavier([fully_connected[-1], num_actions]))
+                self.a_values = tf.matmul(adv, adv_weights)
+                
+            with tf.variable_scope("value"):
+                for num_outputs in fully_connected:
+                    val = layers.fully_connected(val,
+                                                 num_outputs=num_outputs,
+                                                 activation_fn=tf.nn.relu,
+                                                 weights_initializer=xavier)   
+                val_weights = tf.Variable(xavier([fully_connected[-1], 1]))
+                self.v_values = tf.matmul(val, val_weights)
+
+            # q-values estimation
+            with tf.variable_scope("q_values"):
+                avg_a_values = tf.reduce_mean(self.a_values, axis=1, keepdims=True)
+                shifted_a_values = tf.subtract(self.a_values, avg_a_values)
+                self.q_values = self.v_values + shifted_a_values
 
         ######################### Optimization procedure ########################
 
@@ -263,6 +386,83 @@ class DistQNetwork:
             m[np.arange(batch_size), u.astype(int)] += probs[:,j] * (b - l)
 
         return m
+
+    
+####################################################################################################
+######################################## TensorTrain Q-Table #######################################
+####################################################################################################
+
+class QQTTTable:
+    
+    def __init__(self, num_actions, num_colors=2, state_shape=[8, 8, 3],
+                 tt_rank=24, optimizer=tf.train.AdamOptimizer(2.5e-4), 
+                 dtype=tf.float32, scope="qqtt_network", reuse=False):
+        
+        input_shape = np.prod(state_shape) * [num_colors,] + [num_actions,]
+        
+        with tf.variable_scope(scope, reuse=reuse):
+            
+            # random initialization of Q-tensor
+            q0init = t3f.random_tensor(shape=input_shape, tt_rank=tt_rank, stddev=1e-3)
+            q0init = t3f.cast(q0init, dtype=dtype)
+            q0 = t3f.get_variable('Q', initializer=q0init)
+        
+            self.input_states = tf.placeholder(dtype=tf.int32, shape=[None]+state_shape)
+            self.input_actions = tf.placeholder(dtype=tf.int32, shape=[None])
+            self.input_targets = tf.placeholder(dtype=dtype, shape=[None])
+
+            reshaped_s = tf.reshape(self.input_states, (-1, np.prod(state_shape)))
+            reshaped_a = tf.reshape(self.input_actions, (-1, 1))
+            input_s_and_a = tf.concat([reshaped_s, reshaped_a], axis=1) 
+            self.q_selected = t3f.gather_nd(q0, input_s_and_a, dtype=dtype)
+
+            reshaped_s_ = tf.reshape(self.input_states, [-1]+state_shape)
+            
+            # some shitty code
+            s_a_idx = tf.concat(num_actions * [reshaped_s], axis=0) 
+            actions_range = tf.range(start=0, limit=num_actions)
+            a_idx = self.tf_repeat(actions_range, tf.shape(self.input_states)[0:1])
+            s_a_idx = tf.concat([s_a_idx, a_idx], axis=1)
+            vals = t3f.gather_nd(q0, s_a_idx, dtype=dtype)
+            self.q_values = tf.transpose(tf.reshape(vals, shape=(num_actions, -1)))
+            # shitty code ends here
+            
+            self.q_argmax = tf.argmax(self.q_values, axis=1)
+            self.q_max = tf.reduce_max(self.q_values, axis=1)
+            
+            self.loss = tf.losses.huber_loss(self.q_selected, self.input_targets)
+            self.update_model = optimizer.minimize(self.loss)
+        
+    def update(self, sess, states, actions, targets):
+        feed_dict = {self.input_states:states,
+                     self.input_actions:actions,
+                     self.input_targets:targets}
+        sess.run(self.update_model, feed_dict)
+        
+    def get_q_action_values(self, sess, states, actions):
+        feed_dict = {self.input_states:states,
+                     self.input_actions:actions}
+        return sess.run(self.q_selected, feed_dict=feed_dict)
+        
+    def get_q_argmax(self, sess, states):
+        feed_dict = {self.input_states:states}
+        return sess.run(self.q_argmax, feed_dict=feed_dict)
+    
+    def get_q_max(self, sess, states):
+        feed_dict = {self.input_states:states}
+        return sess.run(self.q_max, feed_dict=feed_dict)
+    
+    def get_q_values(self, sess, states):
+        feed_dict = {self.input_states:states}
+        q_values = sess.run(self.q_values, feed_dict)
+        return q_values
+    
+    def tf_repeat(self, x, num):
+        u = tf.reshape(x, (-1, 1))
+        ones = tf.ones(1, dtype=tf.int32)
+        u = tf.tile(u, tf.concat([ones, num], axis=0))
+        u = tf.reshape(u, (-1, 1))
+        return u
 
 ####################################################################################################
 ##################################### Policy Gradient Network ######################################
@@ -495,9 +695,9 @@ class ActorCriticNetwork:
 class ReflexDistQNetwork:
 
     def __init__(self, num_actions, state_shape=[8, 8, 1],
-                 convs=[[32, 4, 2], [64, 2, 1]],
-                 fully_connected=[128], num_atoms=21, v=(-10, 10),
-                 reflex=4, lstm_units=128, optimizer=tf.train.AdamOptimizer(2.5e-4, epsilon=0.01/32),
+                 convs=[[32, 2, 2], [64, 2, 1]],
+                 fully_connected=[64], num_atoms=21, v=(-10, 10),
+                 reflex=4, lstm_units=64, optimizer=tf.train.AdamOptimizer(2.5e-4, epsilon=0.01/32),
                  scope="reflex_distributional_q_network", reuse=False):
 
         """Class for neural network which estimates Q-function distribution
@@ -557,6 +757,21 @@ class ReflexDistQNetwork:
                                                  activation_fn=tf.nn.relu,
                                                  weights_initializer=xavier)
 
+            # reflex head
+            self.lstm_units = lstm_units
+            self.reflex = reflex
+            with tf.variable_scope("reflex"):
+                frames = self.reflex * [out]
+                lstm_layer = rnn.BasicLSTMCell(self.lstm_units, forget_bias=1)
+                outputs, _ = rnn.static_rnn(lstm_layer, frames, dtype="float32")
+                num_outputs = fully_connected[-1]
+                out_final = layers.fully_connected(outputs[-1],
+                                                   num_outputs=num_outputs,
+                                                   activation_fn=tf.nn.relu,
+                                                   weights_initializer=xavier)
+
+            out_with_advice = tf.concat([out, out_final], axis=1)
+
             # distribution parameters
             self.num_atoms = num_atoms
             self.v_min, self.v_max = v
@@ -567,28 +782,12 @@ class ReflexDistQNetwork:
             with tf.variable_scope("probs"):
                 action_probs = []
                 for a in range(num_actions):
-                    action_prob = layers.fully_connected(out,
+                    action_prob = layers.fully_connected(out_with_advice,
                                                          num_outputs=self.num_atoms,
                                                          activation_fn=tf.nn.softmax,
                                                          weights_initializer=xavier)
                     action_probs.append(action_prob)
                 self.probs = tf.stack(action_probs, axis=1)
-
-            # reflex head
-            self.lstm_units = lstm_units
-            self.reflex = reflex
-            with tf.variable_scope("reflex"):
-                frames = self.reflex * [out]
-                lstm_layer = rnn.BasicLSTMCell(self.lstm_units, forget_bias=1)
-                outputs, _ = rnn.static_rnn(lstm_layer, frames, dtype="float32")
-                out_weights = tf.get_variable('lstm_w', shape=(self.lstm_units, num_actions), initializer=xavier)
-                out_bias = tf.get_variable('lstm_b', shape=(num_actions, ), initializer=tf.constant_initializer(0.01))
-                action_preds = []
-                for o in outputs:
-                    action_preds.append(tf.matmul(o, out_weights) + out_bias)
-
-            self.action_preds = action_preds
-            self.action_seq = tf.argmax(tf.stack(action_preds, axis=1), axis=2)
 
 
             # q-values estimation
@@ -689,7 +888,16 @@ class ReplayMemory:
             self.memory.append(None)
         self.memory[self.position] = [*args]
         self.position = (self.position + 1) % self.capacity
+        
+    def push_episode(self, episode_list):
+        
+        self.memory += episode_list
+        
+        gap = len(self.memory) - self.capacity
+        if gap > 0:
+            self.memory[:gap] = []
 
+        
     def get_batch(self, batch_size):
         batch = random.sample(self.memory, batch_size)
         batch = np.reshape(batch, [batch_size, 5])
@@ -702,3 +910,43 @@ class ReplayMemory:
 
     def __len__(self):
         return len(self.memory)
+
+    
+class ReplayMemoryPrio(ReplayMemory):
+
+    def __init__(self, capacity, preprocess_fn=None):
+        super(ReplayMemoryPrio, self).__init__(capacity)
+        self.p = []
+        self.preprocess_fn = preprocess_fn
+
+    def push(self, p, *args):
+        """Saves a transition."""
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+            self.p.append(None)
+        self.memory[self.position] = [*args]
+        self.p[self.position] = p
+        self.position = (self.position + 1) % self.capacity
+
+    def push_episode(self, episode_list):
+        raise NotImplementedError('push_episode is not implemented yet')
+
+    def get_batch(self, batch_size):
+
+        p_ = np.array(self.p)
+
+        if self.preprocess_fn is None:
+            p = p_ / p_.sum()
+        else:
+            p = self.preprocess_fn(p_)
+        
+        batch_idx = np.random.choice(len(self.memory), batch_size, p=p,
+                                     replace=False)
+        batch = [self.memory[i] for i in batch_idx]
+        batch = np.reshape(batch, [batch_size, 5])
+        s = np.stack(batch[:, 0])
+        a = batch[:, 1]
+        r = batch[:, 2]
+        s_ = np.stack(batch[:, 3])
+        end = 1 - batch[:, 4]
+        return self.transition(s, a, r, s_, end)
