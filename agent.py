@@ -16,6 +16,7 @@ vis = args.visualize
 explore = args.explore
 
 env = Snake()
+env.reset()
 # img = s.reset()
 # s.plot_state()
 #
@@ -28,8 +29,8 @@ env = Snake()
 
 rl_client = RLClient ()
 
-observation_size = 3 * 8 * 8
-num_actions = 4
+observation_size = 5 * 8 * 8
+num_actions = 3
 
 n_steps = 1
 
@@ -116,7 +117,11 @@ class MeanCalculator (object):
 
 episode_reward_mean = MeanCalculator()
 
+
 def preprocess_observation(obs):
+    return obs.reshape((-1))
+
+def preprocess_observation_(obs):
 
     # 0 — поле
     # 1 — змейка
@@ -228,13 +233,10 @@ while True:
     # action_received = rl_client.act (prev_obs_seq.get_flatten_obs_seq())
     action_and_value = rl_client.act (prev_obs_seq.get_flatten_youngest())
 
-    if explore and random.randint(0, 19) == 0:
-        action_received = np.random.uniform(-1.0, 1.0, size=num_actions).tolist()
-    else:
-        action_received = action_and_value['action']
-
-    if vis:
-        print('--- q: {}'.format(action_and_value['qvalue']))
+    # if explore and random.randint(0, 19) == 0:
+    #     action_received = np.random.uniform(-1.0, 1.0, size=num_actions).tolist()
+    # else:
+    action_received = action_and_value['action']
 
     action = np.argmax(np.array(action_received) + np.random.normal(scale=0.01, size=num_actions))
     # print('--- action: {} {}'.format(action, action_received))
@@ -246,6 +248,14 @@ while True:
     next_obs_seq.append_obs (next_observation)
     rewards_seq.append_reward (reward)
     actions_seq.append_action (action_received)
+
+    if vis:
+        print('--- q: {: f} {: f} {} {}'.format(
+            action_and_value['qvalue'][0],
+            action_and_value['boltzmann_exploration_t'][0],
+            '^' if action == 0 else '<' if action == 1 else '>',
+            '1' if reward == 1 else ' '
+        ))
 
     if episode_length > n_steps:
         # rl_client.store_exp (

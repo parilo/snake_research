@@ -9,11 +9,11 @@ ps = []
 for i in range (1):
     ps.append(subprocess.Popen(['python', 'agent.py', '--visualize']))
 
-for i in range (12):
+for i in range (24):
     ps.append(subprocess.Popen(['python', 'agent.py']))
 
-for i in range (12):
-    ps.append(subprocess.Popen(['python', 'agent.py', '--explore']))
+# for i in range (12):
+#     ps.append(subprocess.Popen(['python', 'agent.py', '--explore']))
 
 # for i in range (3):
 #     ps.append(subprocess.Popen(['python', 'agent.py']))
